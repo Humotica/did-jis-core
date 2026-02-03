@@ -734,6 +734,328 @@ mod wasm {
 }
 
 // ============================================
+// C Bindings (FFI)
+// ============================================
+
+#[cfg(feature = "cbind")]
+mod cbind {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+    use std::ptr;
+
+    /// Opaque engine handle for C
+    pub struct CEngine {
+        inner: DIDEngine,
+    }
+
+    /// Create a new DID engine
+    #[no_mangle]
+    pub extern "C" fn did_engine_new() -> *mut CEngine {
+        let engine = Box::new(CEngine {
+            inner: DIDEngine::new(),
+        });
+        Box::into_raw(engine)
+    }
+
+    /// Create engine from secret key (hex string)
+    #[no_mangle]
+    pub extern "C" fn did_engine_from_secret(secret_hex: *const c_char) -> *mut CEngine {
+        if secret_hex.is_null() {
+            return ptr::null_mut();
+        }
+
+        let secret_str = unsafe {
+            match CStr::from_ptr(secret_hex).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+
+        let secret_bytes = match hex::decode(secret_str) {
+            Ok(b) => b,
+            Err(_) => return ptr::null_mut(),
+        };
+
+        if secret_bytes.len() != 32 {
+            return ptr::null_mut();
+        }
+
+        let secret: [u8; 32] = match secret_bytes.try_into() {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+
+        let engine = Box::new(CEngine {
+            inner: DIDEngine::from_secret_key(&secret),
+        });
+        Box::into_raw(engine)
+    }
+
+    /// Free the engine
+    #[no_mangle]
+    pub extern "C" fn did_engine_free(engine: *mut CEngine) {
+        if !engine.is_null() {
+            unsafe {
+                drop(Box::from_raw(engine));
+            }
+        }
+    }
+
+    /// Get public key as hex string
+    #[no_mangle]
+    pub extern "C" fn did_get_public_key(engine: *const CEngine) -> *mut c_char {
+        if engine.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let pubkey = engine.inner.public_key_hex();
+
+        match CString::new(pubkey) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Get public key in multibase format
+    #[no_mangle]
+    pub extern "C" fn did_get_public_key_multibase(engine: *const CEngine) -> *mut c_char {
+        if engine.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let pubkey = engine.inner.public_key_multibase();
+
+        match CString::new(pubkey) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Create a did:jis identifier
+    #[no_mangle]
+    pub extern "C" fn did_create(engine: *const CEngine, id: *const c_char) -> *mut c_char {
+        if engine.is_null() || id.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let id_str = unsafe {
+            match CStr::from_ptr(id).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+
+        let did = engine.inner.create_did(id_str);
+
+        match CString::new(did) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Create a DID from public key hash
+    #[no_mangle]
+    pub extern "C" fn did_create_from_key(engine: *const CEngine) -> *mut c_char {
+        if engine.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let did = engine.inner.create_did_from_key();
+
+        match CString::new(did) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Parse a DID string
+    #[no_mangle]
+    pub extern "C" fn did_parse(
+        did: *const c_char,
+        method_out: *mut c_char,
+        id_out: *mut c_char,
+    ) -> bool {
+        if did.is_null() || method_out.is_null() || id_out.is_null() {
+            return false;
+        }
+
+        let did_str = unsafe {
+            match CStr::from_ptr(did).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+
+        match parse_did(did_str) {
+            Some(parsed) => {
+                unsafe {
+                    // Copy method (max 31 chars + null)
+                    let method_bytes = parsed.method.as_bytes();
+                    let method_len = method_bytes.len().min(31);
+                    std::ptr::copy_nonoverlapping(method_bytes.as_ptr(), method_out as *mut u8, method_len);
+                    *method_out.add(method_len) = 0;
+
+                    // Copy id (max 255 chars + null)
+                    let id_bytes = parsed.id.as_bytes();
+                    let id_len = id_bytes.len().min(255);
+                    std::ptr::copy_nonoverlapping(id_bytes.as_ptr(), id_out as *mut u8, id_len);
+                    *id_out.add(id_len) = 0;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Validate a did:jis identifier
+    #[no_mangle]
+    pub extern "C" fn did_is_valid(did: *const c_char) -> bool {
+        if did.is_null() {
+            return false;
+        }
+
+        let did_str = unsafe {
+            match CStr::from_ptr(did).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+
+        is_valid_did(did_str)
+    }
+
+    /// Create a signed DID document
+    #[no_mangle]
+    pub extern "C" fn did_create_document(engine: *const CEngine, did: *const c_char) -> *mut c_char {
+        if engine.is_null() || did.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let did_str = unsafe {
+            match CStr::from_ptr(did).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+
+        match engine.inner.create_signed_document(did_str) {
+            Ok(doc) => match CString::new(doc) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            },
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Sign a message
+    #[no_mangle]
+    pub extern "C" fn did_sign(engine: *const CEngine, message: *const c_char) -> *mut c_char {
+        if engine.is_null() || message.is_null() {
+            return ptr::null_mut();
+        }
+
+        let engine = unsafe { &*engine };
+        let msg_str = unsafe {
+            match CStr::from_ptr(message).to_str() {
+                Ok(s) => s,
+                Err(_) => return ptr::null_mut(),
+            }
+        };
+
+        let signature = engine.inner.sign_string(msg_str);
+
+        match CString::new(signature) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    /// Verify a signature
+    #[no_mangle]
+    pub extern "C" fn did_verify(
+        engine: *const CEngine,
+        message: *const c_char,
+        signature: *const c_char,
+    ) -> bool {
+        if engine.is_null() || message.is_null() || signature.is_null() {
+            return false;
+        }
+
+        let engine = unsafe { &*engine };
+        let msg_str = unsafe {
+            match CStr::from_ptr(message).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let sig_str = unsafe {
+            match CStr::from_ptr(signature).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+
+        engine.inner.verify(msg_str.as_bytes(), sig_str)
+    }
+
+    /// Verify with external public key
+    #[no_mangle]
+    pub extern "C" fn did_verify_with_key(
+        message: *const c_char,
+        signature: *const c_char,
+        public_key_hex: *const c_char,
+    ) -> bool {
+        if message.is_null() || signature.is_null() || public_key_hex.is_null() {
+            return false;
+        }
+
+        let msg_str = unsafe {
+            match CStr::from_ptr(message).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let sig_str = unsafe {
+            match CStr::from_ptr(signature).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let pubkey_str = unsafe {
+            match CStr::from_ptr(public_key_hex).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+
+        DIDEngine::verify_with_key(msg_str.as_bytes(), sig_str, pubkey_str)
+    }
+
+    /// Free a string allocated by DID functions
+    #[no_mangle]
+    pub extern "C" fn did_free_string(s: *mut c_char) {
+        if !s.is_null() {
+            unsafe {
+                drop(CString::from_raw(s));
+            }
+        }
+    }
+
+    /// Get DID:JIS version
+    #[no_mangle]
+    pub extern "C" fn did_version() -> *const c_char {
+        static VERSION: &[u8] = b"0.1.0\0";
+        VERSION.as_ptr() as *const c_char
+    }
+}
+
+// ============================================
 // Tests
 // ============================================
 
